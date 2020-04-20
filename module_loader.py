@@ -2,39 +2,88 @@ import importlib
 import importlib.abc
 import sys
 import io
-from js import loader
-import json
+import tempfile
+import zipfile
+import os
+from js import loader, pyodide, Promise, Object, fetch
+from micropip import _get_url_async
 
 
-sys.remote_path = ['pymodules.json']
+def load_zip_packages(urls):
+    return Promise.all([load_zip_package(url) for url in urls])
+
+
+def load_zip_package(url, zip_prefix=None):
+    """Loads a given zip package as a python module.
+
+    Similar to zipimport, you can contain a path within the archive to only
+    import from that subdirectory. For example,
+    https://github.com/iodide-project/pyodide/archive/master.zip/packages will
+    only import from the packages subdirectory inside the zip file.
+    """
+    zip_file_url, path_inside_zip = url.split('.zip', 1)
+    zip_url = zip_file_url + '.zip'
+
+    def handle_zip_result(bytestream):
+        # zipimport (for Python < 3.8) doesn't support archive comments
+        # so we copy all the files into a new archive
+        fd, zip_path = tempfile.mkstemp(
+            prefix=zip_prefix,
+            suffix='.zip')
+        with zipfile.ZipFile(bytestream, 'r') as zin:
+            with zipfile.ZipFile(open(fd, 'wb'), 'w') as zout:
+                sys.path.append(zip_path + path_inside_zip)
+                for zipinfo in zin.infolist():
+                    zout.writestr(zipinfo, zin.read(zipinfo.filename))
+        return None
+    return _get_url_async(zip_url, handle_zip_result)
+
+
+def add_url_packages(package_dict):
+    iterable = package_dict.items() if hasattr(package_dict, 'items') \
+               else Object.entries(package_dict)
+    for name, url in iterable:
+        add_url_package(name, url)
+    return Promise.resolve(None)
+
+
+def add_url_package(name, url):
+    """Adds a URL-based package.
+
+    After calling this function, importing `name` will try to load the package
+    from `url`, using rules similar to how Python loads from the filesystem.
+    For example, if the URL is http://www.example.python.org/zipimport, it will
+    first try to load http://www.example.python.org/zipimport/__init__.py. If
+    it doesn't exist, then it will try to load
+    http://www.example.python.org/zipimport.py. Implicit namespace packages are
+    not supported because we cannot tell existence of "directories" from a web
+    URL.
+    """
+    _module_loader.add_package(name, url)
+    # Future-proof return value to support asynchronous fetching
+    return Promise.resolve(None)
+
+
+pyodide.loadZipPackage = load_zip_package
+pyodide.loadZipPackages = load_zip_packages
+pyodide.addUrlPackage = add_url_package
+pyodide.addUrlPackages = add_url_packages
 
 
 class InternetPathFinder(importlib.abc.MetaPathFinder):
 
     def __init__(self):
-        self.loaded_listings = set()
         self.package_listings = {}
 
-    def add_packages(**kwargs):
-        listings = dict(kwargs)
-        listings.update(self.package_listings)
-        self.package_listings = listings
-
-    def _load_package_list(self):
-        for url in sys.remote_path:
-            if url not in self.loaded_listings:
-                try:
-                    listing = json.loads(_load_url(url))
-                    listing.update(self.package_listings)
-                    self.package_listings = listing
-                except JsException as e:
-                    print(f'Cannot load listings {url}', e, file=sys.stderr)
-                self.loaded_listings.add(url)
+    def add_package(self, name, url):
+        if name in self.package_listings:
+            return
+        self.package_listings[name] = url
 
     def _load_spec(self, fullname, pkg_url, *, path=None):
         # Import the source mimicking Python's path resolution
         # https://www.python.org/dev/peps/pep-0420/#specification
-        if pkg_url != '__namespace__':
+        if pkg_url:  # Falsy values are used to create namespace packages
             try:
                 file_url = pkg_url + '/__init__.py'
                 spec = importlib.machinery.ModuleSpec(
@@ -72,12 +121,8 @@ class InternetPathFinder(importlib.abc.MetaPathFinder):
             return None
 
     def find_spec(self, fullname, path, target=None):
-        print('finding spec', fullname, path, target)
+        # print('finding spec', fullname, path, target)
         if path is None:
-            if fullname not in self.package_listings:
-                # Refresh the list with any new items added to
-                # sys.remote_path
-                self._load_package_list()
             if fullname in self.package_listings:
                 pkg_url = self.package_listings[fullname]
                 return self._load_spec(fullname, pkg_url)
@@ -102,7 +147,7 @@ class JsException(Exception):
         if self.xhr:
             return f'HTTP error {self.xhr.status}'
         else:
-            return str(err_obj)
+            return str(self.err_obj)
 
 
 def _load_url(url):
@@ -131,6 +176,9 @@ class InternetSourceFileLoader(
         return self
 
     def open_resource(self, resource):
+        # Note: Since this fetches the resources synchronously as text, it will
+        # not work for binary files, since the browser scrubs all invalid
+        # unicode characters.
         try:
             response = _load_url(f'{self.resource_url_prefix}/{resource}')
             return io.BytesIO(response.encode('utf-8'))
@@ -152,5 +200,5 @@ class InternetSourceFileLoader(
         return ()
 
 
-finder = InternetPathFinder()
-sys.meta_path.append(finder)
+_module_loader = InternetPathFinder()
+sys.meta_path.append(_module_loader)

@@ -10,7 +10,33 @@
   </head>
   <body>
     <script>
-      languagePluginLoader.then(() => {
+      self.loader = {
+        open_url: function(url) {
+          let req = new XMLHttpRequest();
+          req.open('GET', url, false);
+          try {
+            req.send();
+            return [req, null];
+          } catch(e) {
+            return [null, e];
+          }
+        }
+      };
+
+      languagePluginLoader.then(async () => {
+        let fetcher = await fetch('module_loader.py');
+        await pyodide.runPythonAsync(await fetcher.text());
+        await pyodide.loadZipPackage('https://cors-anywhere.herokuapp.com/https://github.com/sfneal/PyPDF3/archive/master.zip/PyPDF3-master')
+        await pyodide.addUrlPackages({
+          "hashbang": "hashbang/hashbang",
+          "requests": "https://raw.githubusercontent.com/psf/requests/master/requests",
+          "urllib3": "https://raw.githubusercontent.com/urllib3/urllib3/master/src/urllib3",
+          "chardet": "https://raw.githubusercontent.com/chardet/chardet/master/chardet",
+          "certifi": "https://raw.githubusercontent.com/certifi/python-certifi/master/certifi",
+          "idna": "https://raw.githubusercontent.com/kjd/idna/master/idna",
+          "argcomplete": "https://raw.githubusercontent.com/kislyuk/argcomplete/master/argcomplete",
+        });
+      }).then(() => {
         function pushCode(line) {
           handleResult(c.push(line))
         }
